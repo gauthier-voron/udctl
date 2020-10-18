@@ -1,0 +1,14 @@
+Udctl
+=====
+
+A bunch of script to automate housekeeping for user home data.
+
+
+Update-home
+-----------
+
+Synchronize the home directory with the system base home in '/etc/skel'.
+If a package update changes what should be the environment for new users, there
+is a chance that existing users benefits from it.
+The `udctl update-home` command propagates the changes from '/etc/skel' as long
+as they do not conflict with changes made by the user.
