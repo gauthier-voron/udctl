@@ -1,0 +1,47 @@
+#!/bin/bash
+
+PREFIX="${0%/*}"
+ACTION="$1" ; shift
+
+case "${ACTION}" in
+    'help')
+	case "$1" in
+	    'help')
+		cat <<EOF
+udctl help <command>
+
+Print help about a given command.
+EOF
+		exit 0
+		;;
+	    'update-home')
+		exec "${PREFIX}/udctl-update-home" --help
+		;;
+	    '')
+		cat <<EOF
+udctl <command> [ <args...> ]
+
+Help user to manage its data and perform housekeeping in a semi automatic
+fashion.
+
+Commands:
+
+  help                        Print detailed help about a command.
+
+  update-home                 Keep the home directory synced with the /etc/skel
+                              directory.
+EOF
+		exit 0
+		;;
+	    *)
+		exit 1
+		;;
+	esac
+	;;
+    'update-home')
+	exec "${PREFIX}/udctl-update-home" "$@"
+	;;
+    *)
+	exit 1
+	;;
+esac

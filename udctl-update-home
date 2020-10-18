@@ -1,0 +1,1067 @@
+#!/usr/bin/perl -l
+
+use strict;
+use warnings;
+
+use Digest::MD5;
+use File::Copy;
+use Getopt::Long qw(GetOptionsFromArray :config no_ignore_case);
+use Fcntl ':mode';
+
+
+my $VERSION = '1.0.0';
+my $AUTHOR = 'Gauthier Voron';
+my $EMAIL = 'gauthier.voron@mnesic.fr';
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub error
+{
+    my ($msg) = @_;
+
+    printf(STDERR "udctl: %s\n", $msg);
+}
+
+sub fatal
+{
+    my ($msg) = @_;
+
+    printf(STDERR "udctl: %s\n", $msg);
+    exit (1);
+}
+
+sub report
+{
+    my ($source, $target, $tchild) = @_;
+
+    if (!defined($source)) {
+	if (defined($tchild)) {
+	    printf("udctl: should delete '%s' but has been modified at '%s'\n",
+		   $target, $tchild);
+	} else {
+	    printf("udctl: should delete '%s' but has been modified\n",
+		   $target);
+	}
+    } else {
+	printf("udctl: should update '%s' to '%s' but has been " .
+	       "modified\n", $target, $source);
+    }
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+my %FS_CACHE;
+
+sub clean_fs_cache
+{
+    %FS_CACHE = ();
+}
+
+sub load_fs_cache
+{
+    my ($path) = @_;
+    my $stat = [ lstat($path) ];
+
+    $FS_CACHE{$path} = $stat;
+
+    return $stat;
+}
+
+sub fs_get_type
+{
+    my ($path) = @_;
+    my ($stat);
+
+    $stat = $FS_CACHE{$path};
+
+    if (!defined($stat)) {
+	$stat = load_fs_cache($path);
+    }
+
+    if (scalar(@$stat) == 0) {
+	return 0;
+    }
+
+    return S_IFMT($stat->[2]);
+}
+
+sub fs_exists
+{
+    my ($path) = @_;
+
+    return (fs_get_type($path) != 0);
+}
+
+sub fs_is_symlink
+{
+    my ($path) = @_;
+
+    return (fs_get_type($path) == S_IFLNK);
+}
+
+sub fs_is_regular
+{
+    my ($path) = @_;
+
+    return (fs_get_type($path) == S_IFREG);
+}
+
+sub fs_is_directory
+{
+    my ($path) = @_;
+
+    return (fs_get_type($path) == S_IFDIR);
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub hash_file
+{
+    my ($path) = @_;
+    my ($fh, $ctx);
+
+    if (!open($fh, '<', $path)) {
+	error("cannot open file '$path' : $!");
+	return undef;
+    }
+
+    $ctx = Digest::MD5->new();
+    $ctx->addfile($fh);
+
+    close($fh);
+
+    return $ctx->hexdigest();
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub compare_type
+{
+    my ($a, $b) = @_;
+    my ($typea, $typeb);
+
+    $typea = fs_get_type($a);
+    $typeb = fs_get_type($b);
+
+    return ($typea - $typeb);
+}
+
+sub compare_regular
+{
+    my ($a, $b) = @_;
+    my ($hasha, $hashb);
+
+    $hasha = hash_file($a);
+
+    if (!defined($hasha)) {
+	return undef;
+    }
+
+    $hashb = hash_file($b);
+
+    if (!defined($hashb)) {
+	return undef;
+    }
+
+    if ($hasha lt $hashb) {
+	return -1;
+    } elsif ($hasha gt $hashb) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+sub compare_directory
+{
+    my ($da, $db, %opts) = @_;
+    my ($dh, @eas, @ebs, $pa, $pb, $ret);
+
+    if (!opendir($dh, $da)) {
+	return undef;
+    } else {
+	@eas = sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh);
+	closedir($dh);
+    }
+
+    if (!opendir($dh, $db)) {
+	return undef;
+    } else {
+	@ebs = sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh);
+	closedir($dh);
+    }
+
+    while (@eas && @ebs) {
+	if ($eas[0] lt $ebs[0]) {
+	    if ($opts{DIFF}) {
+		push(@{$opts{DIFF}}, $da . '/' . $eas[0]);
+	    }
+	    return 1;
+	} elsif ($eas[0] gt $ebs[0]) {
+	    if ($opts{DIFF}) {
+		push(@{$opts{DIFF}}, $db . '/' . $ebs[0]);
+	    }
+	    return -1;
+	}
+
+	$pa = $da . '/' . shift(@eas);
+	$pb = $db . '/' . shift(@ebs);
+
+	$ret = compare_tree($pa, $pb, %opts);
+
+	if ($ret != 0) {
+	    return $ret;
+	}
+    }
+
+    if (@eas) {
+	if ($opts{DIFF}) {
+	    push(@{$opts{DIFF}}, $da . '/' . $eas[0]);
+	}
+	return 1;
+    }
+
+    if (@ebs) {
+	if ($opts{DIFF}) {
+	    push(@{$opts{DIFF}}, $db . '/' . $ebs[0]);
+	}
+	return -1;
+    }
+
+    return 0;
+}
+
+sub compare_directory_subset
+{
+    my ($subset, $set, %opts) = @_;
+    my ($dh, @us, $pu, $ps, $ret);
+
+    if (!opendir($dh, $subset)) {
+	return undef;
+    } else {
+	@us = sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh);
+	closedir($dh);
+    }
+
+    while (@us) {
+	$pu = $subset . '/' . $us[0];
+	$ps = $set . '/' . $us[0];
+	shift(@us);
+
+	if (!fs_exists($ps)) {
+	    if ($opts{DIFF}) {
+		push(@{$opts{DIFF}}, $pu);
+	    }
+	    return -1;
+	}
+
+	$ret = compare_tree($pu, $ps, %opts);
+
+	if (!defined($ret) || ($ret != 0)) {
+	    return $ret;
+	}
+    }
+
+    return 0;
+}
+
+sub compare_symlink
+{
+    my ($a, $b) = @_;
+    my ($ca, $cb);
+
+    $ca = readlink($a);
+
+    if (!defined($ca)) {
+	return undef;
+    }
+
+    $cb = readlink($b);
+
+    if (!defined($cb)) {
+	return undef;
+    }
+
+    if ($ca lt $cb) {
+	return -1;
+    } elsif ($ca gt $cb) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+sub compare_tree
+{
+    my ($a, $b, %opts) = @_;
+    my ($ret);
+
+    if ($opts{SUBSET}) {
+	if (!fs_exists($a)) {
+	    return 0;
+	} elsif (!fs_exists($b)) {
+	    if ($opts{DIFF}) {
+		push(@{$opts{DIFF}}, $a);
+	    }
+	    return 1;
+	}
+    }
+
+    $ret = compare_type($a, $b);
+
+    if ($ret != 0) {
+	if ($opts{DIFF}) {
+	    push(@{$opts{DIFF}}, $a);
+	}
+	return $ret;
+    }
+
+    if (!fs_exists($a)) {
+	return 0;
+    } elsif (fs_is_symlink($a)) {
+	$ret = compare_symlink($a, $b);
+	if (defined($ret) && ($ret != 0) && $opts{DIFF}) {
+	    push(@{$opts{DIFF}}, $a);
+	}
+    } elsif (fs_is_regular($a)) {
+	$ret = compare_regular($a, $b);
+	if (defined($ret) && ($ret != 0) && $opts{DIFF}) {
+	    push(@{$opts{DIFF}}, $a);
+	}
+    } elsif (fs_is_directory($a)) {
+	if ($opts{SUBSET}) {
+	    return compare_directory_subset($a, $b, %opts);
+	} else {
+	    return compare_directory($a, $b, %opts);
+	}
+    # } else {
+	# impossible because of compare_type()
+    }
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub delete_tree_directory
+{
+    my ($path) = @_;
+    my ($dh, $entry, $ret);
+
+    if (!opendir($dh, $path)) {
+	error("cannot delete directory '$path' : $!");
+	return 0;
+    }
+
+    $ret = 1;
+
+    foreach $entry (grep { ! /^\.\.?$/ } readdir($dh)) {
+	$ret &= delete_tree($path . '/' . $entry);
+    }
+
+    closedir($dh);
+
+    if ($ret == 0) {
+	return $ret;
+    }
+
+    if (!rmdir($path)) {
+	error("cannot delete directory '$path' : $!");
+	return 0;
+    }
+
+    return 1;
+}
+
+sub delete_tree
+{
+    my ($path) = @_;
+
+    if (fs_is_directory($path)) {
+	return delete_tree_directory($path);
+    }
+
+    if (!unlink($path)) {
+	error("cannot delete '$path' : $!");
+	return 0;
+    }
+
+    return 1;
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub update_forward_entry
+{
+    my ($source, $target) = @_;
+
+    if (fs_exists($target)) {
+	if (compare_type($source, $target) == 0) {
+	    if (fs_is_symlink($source)) {
+		if (compare_symlink($source, $target) == 0) {
+		    return 0;
+		} else {
+		    report($source, $target);
+		    return 0;
+		}
+	    } elsif (fs_is_regular($source)) {
+		if (compare_regular($source, $target) == 0) {
+		    return 0;
+		} else {
+		    report($source, $target);
+		    return 0;
+		}
+	    } elsif (fs_is_directory($source)) {
+		return update_forward($source, $target);
+	    } else {
+		error();
+		return -1;
+	    }
+	} else {
+	    report($source, $target);
+	    return 0;
+	}
+    } else {
+	if (fs_is_symlink($source)) {
+	    return update_diff_symlink($source, $target);
+	} elsif (fs_is_regular($source)) {
+	    return update_diff_regular($source, $target);
+	} elsif (fs_is_directory($source)) {
+	    if (!mkdir($target)) {
+		error();
+		return undef;
+	    }
+
+	    clean_fs_cache();
+
+	    return update_forward($source, $target);
+	} else {
+	    error();
+	    return -1;
+	}
+    }
+}
+
+# If source is the same than target => leave as it is silently
+# If there is source but no target => update target
+# If source and target differ => report
+#
+sub update_forward
+{
+    my ($source, $target) = @_;
+    my ($dh, $entry, $ret, $spath, $tpath);
+
+    if (!opendir($dh, $source)) {
+	error("cannot open directory '$source'");
+	return undef;
+    }
+
+    $ret = 0;
+
+    foreach $entry (sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh)) {
+	$spath = $source . '/' . $entry;
+	$tpath = $target . '/' . $entry;
+	$ret |= update_forward_entry($spath, $tpath);
+    }
+
+    closedir($dh);
+
+    return $ret;
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub update_diff_symlink
+{
+    my ($source, $target) = @_;
+    my ($content);
+
+    if (fs_exists($target) && !unlink($target)) {
+	error("cannot delete symlink '$target' : $!");
+	return -1;
+    }
+
+    if (!defined($source)) {
+	return 0;
+    }
+
+    $content = readlink($source);
+
+    if (!defined($content)) {
+	error("cannot read symlink '$source' : $!");
+	return -1;
+    }
+
+    if (!symlink($content, $target)) {
+	error("cannot update symlink '$target' : $!");
+	return -1;
+    }
+
+    return 0;
+}
+
+sub update_diff_regular
+{
+    my ($source, $target) = @_;
+
+    if (fs_exists($target) && !unlink($target)) {
+	error("cannot delete file '$target' : $!");
+	return -1;
+    }
+
+    if (!defined($source)) {
+	return 0;
+    }
+
+    if (!copy($source, $target)) {
+	error("cannot update regular file '$target' : $!");
+	return -1;
+    }
+
+    return 0;
+}
+
+sub update_diff_entry
+{
+    my ($source, $target, $snapshot) = @_;
+    my (@difflist, $entry);
+
+    if (defined($source)) {
+	if (defined($snapshot)) {
+	    if (compare_type($source, $snapshot) == 0) {
+		if (fs_is_symlink($source)) {
+		    if (compare_symlink($source, $snapshot) == 0) {
+			# source is the same than snapshot, leave silently
+			return 0;
+		    } else {
+			if (fs_is_symlink($target)) {
+			    if (compare_symlink($target, $snapshot) == 0) {
+				# target is the same than snapshot, update
+				# silently
+				return update_diff_symlink($source, $target);
+			    } elsif (compare_symlink($source, $target) == 0) {
+				# source is the same than target, leave
+				# silently
+				return 0
+			    }
+			} else {
+			    # All differ, report and leave
+			    report($source, $target);
+			    return 0;
+			}
+		    }
+		} elsif (fs_is_regular($source)) {
+		    if (compare_regular($source, $snapshot) == 0) {
+			# source is the same than snapshot, leave silently
+			return 0;
+		    } else {
+			if (fs_is_regular($target)) {
+			    if (compare_regular($target, $snapshot) == 0) {
+				# target is the same than snapshot, update
+				# silently
+				return update_diff_regular($source, $target);
+			    } elsif (compare_regular($source, $target) == 0) {
+				# source is the same than target, leave
+				# silently
+				return 0
+			    }
+			} else {
+			    # All differ, report and leave
+			    report($source, $target);
+			    return 0;
+			}
+		    }
+		} elsif (fs_is_directory($source)) {
+		    if (fs_is_directory($target)) {
+			# Everyone is a directory, go recursively
+			return update_diff($source, $target, $snapshot);
+		    } else {
+			# Cannot go recursively, check is source and snapshot
+			# are deeply identical. If so, leave silently, else
+			# report
+			if (compare_tree($source, $snapshot) == 0) {
+			    return 0;
+			} else {
+			    report($source, $target);
+			    return 0;
+			}
+		    }
+		} else {
+		    # Unknown type for source, report an error and leave
+		    error("unknown type for '$source'");
+		    return -1;
+		}
+	    } else {  # compare_type($source, $snapshot) != 0
+		if (fs_exists($target)) {
+		    if (compare_type($source, $target) == 0) {
+			if (fs_is_symlink($source)) {
+			    if (compare_symlink($source, $target) == 0) {
+				# source is the same than target, leave
+				# silently
+				return 0;
+			    } else {
+				# All differs, report and leave
+				report($source, $target);
+				return 0;
+			    }
+			} elsif (fs_is_regular($source)) {
+			    if (compare_regular($source, $target) == 0) {
+				# source is the same than target, leave
+				# silently
+				return 0;
+			    } else {
+				# All differs, report and leave
+				report($source, $target);
+				return 0;
+			    }
+			} elsif (fs_is_directory($source)) {
+			    # source and target are tree but snapshot is not,
+			    # report recursively every difference between
+			    # source and target and leave
+			    if (compare_tree($source, $target,
+					     DIFF => \@difflist) != 0) {
+				foreach $entry (@difflist) {
+				    report($source . '/' . $entry,
+					   $target . '/' . $entry);
+				}
+			    }
+			    return 0;
+			} else {
+			    # Unknown type for source, report an error and
+			    # leave
+			    error();
+			    return -1;
+			}
+		    } else {  # compare_type($source, $target) != 0
+			if (compare_type($target, $snapshot) == 0) {
+			    if (fs_is_symlink($snapshot)) {
+				if (compare_symlink($target, $snapshot) == 0) {
+				    # snapshot is the same than target, update
+				    # silently
+				    return update_diff_symlink(undef, $target);
+				} else {
+				    # All differ, report and leave
+				    report(undef, $target);
+				    return 0;
+				}
+			    } elsif (fs_is_regular($snapshot)) {
+				if (compare_regular($target, $snapshot) == 0) {
+				    # snapshot is the same than target, update
+				    # silently
+				    return update_diff_regular(undef, $target);
+				} else {
+				    # All differ, report and leave
+				    report(undef, $target);
+				    return 0;
+				}
+			    } elsif (fs_is_directory($snapshot)) {
+				# Cannot go recursively, check if target is a
+				# subset of snapshot. If so, update silently,
+				# else report
+				if (compare_tree($target, $snapshot,
+						 SUBSET => 1,
+						 DIFF => \@difflist) != 0) {
+				    foreach $entry (@difflist) {
+					report(undef, $target, $entry);
+				    }
+				    return 0;
+				} else {
+				    if (!delete_tree($target)) {
+					return -1;
+				    }
+
+				    clean_fs_cache();
+
+				    if (fs_is_symlink($source)) {
+					return update_diff_symlink($source,
+								   $target);
+				    } elsif (fs_is_regular($source)) {
+					return update_diff_regular($source,
+								   $target);
+				    } else {
+					# Unknown type for snapshot, report an
+					# error and leave
+					error();
+					return -1;
+				    }
+				}
+			    } else {
+				# Unknown type for snapshot, report an error
+				# and leave
+				error();
+				return -1;
+			    }
+			} else {  # compare_type($target, $snapshot) == 0
+			    # All differs, report and leave
+			    report($source, $target);
+			    return 0;
+			}
+		    }
+		} else {  # !fs_exists($target)
+		    # All differ, report and leave
+		    report($source, undef);
+		    return 0;
+		}
+	    }
+	} else {  # !defined($snapshot)
+	    if (fs_exists($target)) {
+		if (compare_type($source, $target) == 0) {
+		    if (fs_is_symlink($source)) {
+			if (compare_symlink($source, $target) == 0) {
+			    # source is the same than target, leave
+			    # silently
+			    return 0;
+			} else {
+			    # All differs, report and leave
+			    report($source, $target);
+			    return 0;
+			}
+		    } elsif (fs_is_regular($source)) {
+			if (compare_regular($source, $target) == 0) {
+			    # source is the same than target, leave
+			    # silently
+			    return 0;
+			} else {
+			    # All differs, report and leave
+			    report($source, $target);
+			    return 0;
+			}
+		    } elsif (fs_is_directory($source)) {
+			# source and target are tree but snapshot is not,
+			# report recursively every difference between
+			# source and target and leave
+			if (compare_tree($source, $target,-
+					 DIFF => \@difflist) != 0) {
+			    foreach $entry (@difflist) {
+				report($source . '/' . $entry,
+				       $target . '/' . $entry);
+			    }
+			}
+			return 0;
+		    } else {
+			# Unknown type for source, report an error and leave
+			error();
+			return -1;
+		    }
+		} else {  # compare_type($source, $target) != 0
+		    # All differ, report and leave
+		    report($source, $target);
+		    return 0;
+		}
+	    } else {  # !fs_exists($target)
+		# target is the same than snapshot, update silently
+		return update_forward_entry($source, $target);
+	    }
+	}
+    } else {  # !defined($source)
+	if (defined($snapshot)) {
+	    if (fs_exists($target)) {
+		if (compare_type($target, $snapshot) == 0) {
+		    if (fs_is_symlink($snapshot)) {
+			if (compare_symlink($target, $snapshot) == 0) {
+			    # snapshot is the same than target, update silently
+			    return update_diff_symlink(undef, $target);
+			} else {
+			    # All differ, report and leave
+			    report(undef, $target);
+			    return 0;
+			}
+		    } elsif (fs_is_regular($snapshot)) {
+			if (compare_regular($target, $snapshot) == 0) {
+			    # snapshot is the same than target, update silently
+			    return update_diff_regular(undef, $target);
+			} else {
+			    # All differ, report and leave
+			    report(undef, $target);
+			    return 0;
+			}
+		    } elsif (fs_is_directory($snapshot)) {
+			# Cannot go recursively, check if target is a subset
+			# of snapshot. If so, update silently, else report
+			if (compare_tree($target, $snapshot, SUBSET => 1,
+					 DIFF => \@difflist) != 0) {
+			    foreach $entry (@difflist) {
+				report(undef, $target, $entry);
+			    }
+			    return 0;
+			} else {
+			    if (!delete_tree($target)) {
+				return -1;
+			    } else {
+				return 0;
+			    }
+			}
+		    } else {
+			# Unknown type for snapshot, report an error and leave
+			error();
+			return -1;
+		    }
+		} else {  # compare_type($target, $snapshot) != 0
+		    # All differ, report and leave
+		    report(undef, $target);
+		    return 0;
+		}
+	    } else {
+		# source is the same than target, leave silently
+		return 0
+	    }
+	} else {  # !defined($snapshot)
+	    # source is the same than snapshot, leave silently
+	    return 0;
+	}
+    }
+}
+
+# If source is the same than target => leave as it is silently
+# If source is the same than snapshot => leave as it is silently
+# If target is the same than snapshot => change to source silently
+# If all differs => report
+#
+sub update_diff
+{
+    my ($source, $target, $snapshot) = @_;
+    my ($dh, @nentries, @oentries, $npath, $opath, $tpath, $ret, $tmp);
+
+    if (!opendir($dh, $source)) {
+	error("cannot open '$source' : $!");
+	return -1;
+    }
+
+    @nentries = sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh);
+    closedir($dh);
+
+    if (!opendir($dh, $snapshot)) {
+	error("cannot open '$snapshot' : $!");
+	return -1;
+    }
+
+    @oentries = sort { $a cmp $b } grep { ! /^\.\.?$/ } readdir($dh);
+    closedir($dh);
+
+    $ret = 0;
+
+    while (@nentries && @oentries) {
+	if ($nentries[0] eq $oentries[0]) {
+	    $npath = $source . '/' . $nentries[0];
+	    $opath = $snapshot . '/' . $oentries[0];
+	    $tpath = $target . '/' . $nentries[0];
+	    shift(@nentries);
+	    shift(@oentries);
+	} elsif ($nentries[0] lt $oentries[0]) {
+	    $npath = $source . '/' . $nentries[0];
+	    $opath = undef;
+	    $tpath = $target . '/' . $nentries[0];
+	    shift(@nentries);
+	} else {  # ($nentries[0] gt $oentries[0])
+	    $npath = undef;
+	    $opath = $snapshot . '/' . $oentries[0];
+	    $tpath = $target . '/' . $oentries[0];
+	    shift(@oentries);
+	}
+
+	$ret |= update_diff_entry($npath, $tpath, $opath);
+    }
+
+    while (@nentries) {
+	$npath = $source . '/' . $nentries[0];
+	$tpath = $target . '/' . $nentries[0];
+	shift(@nentries);
+	$ret |= update_diff_entry($npath, $tpath, undef);
+    }
+
+    while (@oentries) {
+	$opath = $snapshot . '/' . $oentries[0];
+	$tpath = $target . '/' . $oentries[0];
+	shift(@oentries);
+	$ret |= update_diff_entry(undef, $tpath, $opath);
+    }
+
+    return $ret;
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub usage
+{
+    printf("%s", <<EOF);
+udctl update-home [ <options...> ]
+
+Synchronize the content of the user's home with the system wide home base.
+
+On the first synchronization (forward mode), only add files from the system
+base to the user home if they do not conflict and save a snapshot of the system
+base.
+
+On subsequent synchronizations (diff mode), compare the system base to the
+snapshot and apply changes which do not conflict to the home directory and
+update the snapshot.
+
+In case of conflict, report a message and let the file unmodified.
+
+
+Options:
+
+  -H, --home <path>           Use the specified <path> instead of HOME as the
+                              user's root.
+
+  -h, --help                  Print this message and exit.
+
+  -m, --mode <mode>           Explicitely force the mode to 'forward' or
+                              'diff'.
+
+  -s, --skel <path>           Use the specified <path> instead of '/etc/skel'
+                              as the system base.
+
+  -S, --snapshot <path>       Use the specified <path> instead of XDG_DATA_HOME
+                              to store the snapshot.
+
+  -V, --version               Print version information and exit.
+
+EOF
+}
+
+sub version
+{
+    printf("%s", <<EOF);
+udctl-update-home $VERSION
+$AUTHOR
+$EMAIL
+EOF
+}
+
+sub get_default_skel
+{
+    return '/etc/skel';
+}
+
+sub get_default_home
+{
+    return $ENV{'HOME'};
+}
+
+sub get_default_data
+{
+    my ($home) = @_;
+    my $ret;
+
+    $ret = $ENV{'XDG_DATA_HOME'};
+
+    if (defined($ret)) {
+	return $ret;
+    }
+
+    $ret = $home . '/.local/share';
+
+    if (!fs_exists($ret)) {
+	return undef;
+    }
+
+    return $ret;
+}
+
+sub get_default_snapshot
+{
+    my ($home) = @_;
+    my $data = get_default_data($home);
+    my $ret;
+
+    if (!defined($data)) {
+	return undef;
+    }
+
+    $ret = $data . '/udctl';
+
+    if (!fs_exists($ret) && !mkdir($ret)) {
+	return undef;
+    }
+
+    $ret .= '/skel-snapshot';
+
+    return $ret;
+}
+
+sub main
+{
+    my ($help, $version, $mode, $skel, $home, $snapshot);
+    my ($warn, $ret);
+
+    $warn = $SIG{'__WARN__'};
+    $SIG{'__WARN__'} = sub {
+	my ($msg) = @_;
+
+	if ($msg =~ m|Unknown option: (.*)|) {
+	    fatal("unknown option: $1");
+	}
+
+	fatal($msg);
+    };
+
+    GetOptionsFromArray(
+	\@_,
+	'H|home=s' => \$home,
+	'h|help' => \$help,
+	'm|mode=s' => \$mode,
+	's|skel=s' => \$skel,
+	'S|snapshot=s' => \$snapshot,
+	'V|version' => \$version,
+	);
+
+    $SIG{'__WARN__'} = $warn;
+
+    if (defined($help)) {
+	usage();
+	return 0;
+    } elsif (defined($version)) {
+	version();
+	return 0;
+    }
+
+    if (!defined($skel)) {
+	$skel = get_default_skel();
+    }
+
+    if (!defined($home)) {
+	$home = get_default_home();
+    }
+
+    if (!defined($snapshot)) {
+	$snapshot = get_default_snapshot($home);
+    }
+
+    if (!defined($mode)) {
+	if (defined($snapshot) && fs_exists($snapshot)) {
+	    $mode = 'diff';
+	} else {
+	    $mode = 'forward';
+	}
+    }
+
+    if ($mode eq 'forward') {
+	$ret = update_forward($skel, $home);
+    } elsif ($mode eq 'diff') {
+	if (!defined($snapshot) || !fs_exists($snapshot)) {
+	    fatal("cannot find snapshot directory '$snapshot'");
+	}
+
+	$ret = update_diff($skel, $home, $snapshot);
+
+	delete_tree($snapshot);
+
+	clean_fs_cache();
+    } else {
+	fatal("unknown mode: '$mode'");
+    }
+
+    if (defined($snapshot)) {
+	if (!mkdir($snapshot)) {
+	    fatal("cannot create snapshot directory '$snapshot'");
+	}
+
+	update_forward($skel, $snapshot);
+    }
+
+    return $ret;
+}
+
+
+exit (main(@ARGV));
+__END__

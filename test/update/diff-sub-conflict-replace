@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -e
+set -x
+
+mkdir 'skel'
+echo 'v0' > 'skel/f0'
+mkdir 'skel/d0'
+echo 'v0' > 'skel/d0/f1'
+mkdir 'skel/d1'
+ln -s 'd0/f1' 'skel/l0'
+
+cp -R 'skel' 'snapshot'
+cp -R 'skel' 'home'
+
+rm -rf 'skel/d0'
+echo 'v0' > 'skel/d0'
+rm -rf 'skel/d1'
+echo 'v0' > 'skel/d1'
+
+echo 'v1' > 'home/d0/f1'
+echo 'v0' > 'home/d1/f2'
+
+cp -R 'home' 'result'
+
+udctl update-home --skel='skel' --home='home' --snapshot='snapshot' \
+      --mode=diff > 'out'
+
+cat 'out' >&2
+
+(
+    read line ; echo "$line" | grep -q "'home/d0'.*modified.*'home/d0/f1'"
+    read line ; echo "$line" | grep -q "'home/d1'.*modified.*'home/d1/f2'"
+) < 'out'
+
+diff -Naur --no-dereference 'home' 'result'

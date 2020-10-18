@@ -1,0 +1,24 @@
+#!/bin/bash
+
+set -e
+set -x
+
+mkdir 'skel'
+echo 'v0' > 'skel/f0'
+mkdir 'skel/d0'
+echo 'v0' > 'skel/d0/f1'
+ln -s 'd0/f1' 'skel/l0'
+
+cp -R 'skel' 'home'
+
+rm 'skel/f0'
+rm -rf 'skel/d0'
+rm 'skel/l0'
+
+cp -R 'home' 'result'
+
+udctl update-home --skel='skel' --home='home' --mode=forward > 'out'
+
+test ! -s 'out'
+
+diff -Naur --no-dereference 'home' 'result'

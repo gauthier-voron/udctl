@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -e
+set -x
+
+mkdir 'skel'
+echo 'v0' > 'skel/f0'
+mkdir 'skel/d0'
+echo 'v0' > 'skel/d0/f1'
+ln -s 'd0/f1' 'skel/l0'
+
+cp -R 'skel' 'snapshot'
+cp -R 'skel' 'home'
+
+rm -rf 'skel/d0'
+
+rm 'home/d0/f1'
+
+udctl update-home --skel='skel' --home='home' --snapshot='snapshot' \
+      --mode=diff > 'out'
+
+test ! -s 'out'
+
+cp -R 'skel' 'result'
+
+diff -Naur --no-dereference 'home' 'result'

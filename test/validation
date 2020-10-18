@@ -1,0 +1,62 @@
+#!/bin/bash
+
+TDIR="${0%/*}"
+SCRIPTS=()
+VDIRS=("${TDIR}/update")
+
+
+gather_scripts() {
+    local dir script
+
+    for dir in "${VDIRS[@]}" ; do
+	for script in "${dir}/"* ; do
+	    SCRIPTS+=("${script}")
+	done
+    done
+}
+
+run_script() {
+    local script="$1" ; shift
+    local sandbox results ret
+
+    sandbox="$(mktemp -d --suffix='.tmp' 'homectl-validation.XXXXXXXXXXX')"
+    results="$(mktemp --suffix='.log' 'homectl-validation.XXXXXXXXXXX')"
+
+    if [ "x${script:0:1}" != 'x/' ] ; then
+	script="${PWD}/${script}"
+    fi
+
+    printf "%-30s " "${script##*/}"
+
+    (
+	export PATH="${PWD}:${PATH}"
+
+	cd "${sandbox}"
+
+	"${script}"
+    ) > "${results}" 2>&1
+
+    ret=$?
+
+    if [ ${ret} -ne 0 ] ; then
+	echo "FAIL"
+
+	echo '  - Logs'
+	sed 's/^/  > /' "${results}"
+
+	echo '  - Content'
+	ls -lR "${sandbox}" | sed 's/^/  > /'
+    else
+	echo "OK"
+    fi
+
+    rm -rf "${sandbox}"
+    rm -rf "${results}"
+}
+
+
+gather_scripts
+
+for script in "${SCRIPTS[@]}" ; do
+    run_script "${script}"
+done
